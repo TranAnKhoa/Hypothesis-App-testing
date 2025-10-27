@@ -1,0 +1,358 @@
+# Python code integrating the user's data generation and a Bottom-Up Greedy Heuristic (Heuristic 1).
+# This will run a single instance on the provided BOM and item_data/time_data,
+# simulate over n_periods, and print summary results and key matrices.
+#
+# Behavior choices:
+# - If a child has parents, heuristic will try to schedule parent disassembly to satisfy demand.
+# - Parent selection is based on efficiency = usable_units_per_parent_unit / disassembly_time.
+# - If capacity insufficient, heuristic will try to use overtime (up to F_t).
+# - If still unable to meet demand, heuristic will purchase immediately (Z) for that item.
+# - Defective rates applied to produced children when parent is disassembled.
+#
+# Note: This is a straightforward, explainable greedy heuristic (not optimal but runnable).
+import numpy as np
+import pandas as pd
+from math import ceil, floor
+
+# ---------- User-supplied data (from previous message) ----------
+n_items = 10
+n_periods = 10
+np.random.seed(47)
+
+# Item-level params (constructed exactly as user code)
+holding = np.random.randint(12, 21, n_items)                    # holding cost h_i
+setup = np.random.randint(0, 1001, n_items)                     # setup cost S_i
+backorder = 2 * holding                                         # backorder cost b_i
+dis_time = np.random.randint(1, 5, n_items)                     # G_i
+setup_time = np.random.randint(10, 51, n_items)                 # ST_i
+alpha = np.random.randint(0, 11, n_items) / 100                 # defective rate
+sale_price = 1.5 * (holding + setup_time)                       # SC_i
+external_sale = 1.8 * sale_price                                 # C_i
+lead_time = np.random.choice([0,1,2], size=n_items, p=[0.3,0.4,0.3])
+#leadtime = [1,0,2,1,0,2,1,0,1,2] --> LT tương ứng cho từng items
+
+item_data = pd.DataFrame({
+    "Item": [f"Item_{i+1}" for i in range(n_items)],
+    "holding_i": holding,
+    "setup_i": setup,
+    "backorder_i": backorder,
+    "distime_i": dis_time,
+    "setup_time_i": setup_time,
+    "alpha_i": alpha,
+    "sale_price_i": np.round(sale_price, 2),
+    "external_sale_i": np.round(external_sale, 2),
+    "lead_time_i": lead_time
+})
+
+# Time-dependent params
+Avai_capa = np.random.randint(240, 481, n_periods)
+Extra_capa = np.random.randint(60, 121, n_periods)
+Over_capa = np.random.randint(20, 26, n_periods)
+
+time_data = pd.DataFrame({
+    "Period": range(1, n_periods+1),
+    "U_t": Avai_capa,
+    "F_t": Extra_capa,
+    "O_t": Over_capa
+})
+
+# Demand matrix (user earlier used random; we keep a deterministic seed above)
+Demand = np.random.randint(0, 101, size=(n_items, n_periods))
+
+# BOM per user's final 3-level structure
+BOM = {0: {2: 2, 3: 1}, 4: {5: 2, 6: 1}, 7: {2: 1, 5: 3, 6: 2},
+       2: {1: 3, 9: 2}, 3: {1: 2, 9: 1}, 5: {1: 1, 9: 3}, 6: {1: 4, 9: 2},
+       1: {}, 9: {}, 8: {}}
+
+# helper maps
+parents = {i: [] for i in range(n_items)} #parents = {0: [], 1: [], 2: [], 3: [0], 4: [], 5: [], 6: [], 7: [], 8: [], 9: []}
+children = {i: {} for i in range(n_items)}# children = {0: {}, 1: {}, 2: {}, 3: {}, 4: {}, 5: {}, 6: {}, 7: {}, 8: {}, 9: {}}
+for p,v in BOM.items():
+    children[p] = dict(v)  # may be empty
+    for c, r in v.items():
+        parents[c].append(p) #parents = {0: [], 1: [2,3,5,6], 2: [0,7], 3: [0], 4: [], 5: [4,7], 6: [4,7], 7: [], 8: [], 9: [2,3,5,6]}
+
+# levels (as user requested): level1: [0,4,7], level2: [2,3,5,6], level3: [1,9]
+levels = {1: [0,4,7], 2: [2,3,5,6], 3: [1,9]}
+
+# ---------- Initialize variables ----------
+X = np.zeros((n_items, n_periods), dtype=int)   # disassembly qty of parent i at period t
+Z = np.zeros((n_items, n_periods), dtype=int)   # purchased qty of item i at period t
+Y = np.zeros(n_periods, dtype=int)              # overtime time units used in each period
+Iplus = np.zeros((n_items, n_periods+1), dtype=float)   # on-hand inventory at end of period
+Iminus = np.zeros((n_items, n_periods+1), dtype=float)  # backorders at end of period
+W = np.zeros((n_items, n_periods), dtype=float)         # defective qty of item i produced in period t
+delta = np.zeros((n_items, n_periods), dtype=int)       # setup indicator
+
+# receipts buffer: produced usable child units arriving at a future period due to lead times
+#! Lượng hàng đệm buffer (trong lúc đợi hàng về)
+receipts = np.zeros((n_items, n_periods+1), dtype=float)  # receipts[i, t] added to inventory at start of period t
+
+# For reporting sold quantities (fulfilled from inventory in period t)
+#! Số lượng hàng đã bán được ở kỳ t
+Q_sold = np.zeros((n_items, n_periods), dtype=float)
+
+# Extract arrays for simpler access
+h = item_data["holding_i"].to_numpy() # holding cost
+S = item_data["setup_i"].to_numpy() # setup cost
+b = item_data["backorder_i"].to_numpy() # backorder cost
+G = item_data["distime_i"].to_numpy() # disassembly time
+ST = item_data["setup_time_i"].to_numpy() # setup time
+alpha = item_data["alpha_i"].to_numpy() # defective rate
+SC = item_data["sale_price_i"].to_numpy() # sales price
+C = item_data["external_sale_i"].to_numpy() # purchase cost
+L = item_data["lead_time_i"].to_numpy() # lead time
+
+U = time_data["U_t"].to_numpy()
+F = time_data["F_t"].to_numpy()
+Ocost = time_data["O_t"].to_numpy()
+
+# ---------- Heuristic simulation ----------
+# We process periods sequentially. At start of period t we add receipts arriving at t to inventory.
+for t in range(n_periods):
+    # 1) add receipts available this period to inventory
+    Iplus[:, t] += receipts[:, t]  # receipts from previously scheduled parents
+    # cap negative small numerical errors
+    Iplus[:, t] = np.maximum(Iplus[:, t], 0.0)  
+
+    
+    capacity_used = 0.0 #reset capacity cho mỗi kỳ mới
+    setup_done = np.zeros(n_items, dtype=int) #setup_done = [0,0,0,0,0,0,0,0,0,0]
+    
+    # Process bottom-up: leaf level (3) -> level2 -> level1
+    for lvl in [3, 2, 1]:
+        for i in levels[lvl]:
+            # demand in this period (external demand)
+            demand = Demand[i, t]
+            
+            # available inventory now
+            avail = Iplus[i, t]
+            
+            # backorders from previous periods (we attempt to satisfy them too)
+            pending_backorder = Iminus[i, t]
+            #! Nếu có backorder từ kỳ trước --> ưu tiên dùng hàng tồn để đáp ứng đơn hàng tồn trước
+            if pending_backorder > 0:
+                # try to satisfy backorder before new demand (use avail)
+                use = min(avail, pending_backorder)
+                Iplus[i, t] -= use # reduce inventory
+                Iminus[i, t] -= use # reduce backorder
+                avail -= use # update available inventory
+                Q_sold[i, t] += use
+
+            # now attempt to satisfy current demand
+            need = max(0.0, demand - avail) #sau khi đã dùng hàng tồn để đáp ứng đơn hàng hiện tại --> cần bao nhiêu
+            
+            #TODO nếu hàng đủ --> chỉ lấy hàng trong kho
+            if need <= 0: 
+                # fully satisfied by inventory
+                Iplus[i, t] -= demand
+                Q_sold[i, t] += demand
+                continue  # next item
+            
+            #TODO nếu hàng không đủ --> cần mua ngoài 
+            # If item has no parents => we can buy externally immediately (Z)
+            if len(parents[i]) == 0: #! nếu nó là cha --> k thể tháo
+                # buy immediate to satisfy need
+                buy_qty = int(ceil(need)) #làm tròn lên để mua đủ
+                Z[i, t] += buy_qty # mua ngoài
+                # purchased units assumed immediately available to meet demand
+                Q_sold[i, t] += need 
+                # inventory reduces by demand (we bought and consumed)
+                # keep fractional residues if any
+                # any rounding surplus added to inventory for next period
+                surplus = buy_qty - need #phần bị dư
+                Iplus[i, t] += surplus - 0.0  # consumed need #TODO đẩy vào tồn kho
+                continue
+            
+            # item has parents: we try to schedule parent disassemblies to produce usable child units
+            remaining_need = need
+            # sort parents by efficiency (usable child units per parent unit) / time = ((1-alpha_child)*R[parent,child]) / G[parent]
+            parent_list = parents[i].copy() #tạo danh sách cha của i
+            def efficiency(p): #sắp xếp thứ tự ưu tiên của các cha
+                R = children[p].get(i, 0) # số lượng con i thu được từ cha p
+                usable_per_parent = (1.0 - alpha[i]) * R  #số lượng con i có thể đc sử dụng (k bị defect) từ cha p
+                # avoid division by zero
+                return usable_per_parent / max(1e-6, G[p]) #hiệu quả = số con i sử dụng đc / thời gian tháo cha p
+            parent_list.sort(key=efficiency, reverse=True) #! Sort theo efficiency giảm dần
+            
+            for p in parent_list:   #lặp qua các cha từ tốt nhất đến tệ nhất
+                if remaining_need <= 0:
+                    break
+                Rpi = children[p].get(i, 0) # số lượng con i thu được từ cha p
+                if Rpi == 0: 
+                    continue
+                # how many child usable units does one parent unit provide?
+                usable_per_parent = (1.0 - alpha[i]) * Rpi 
+                # # parent units required to cover remaining_need (ceiling)
+                required_parent_units = int(ceil(remaining_need / usable_per_parent)) #số lượng cha p cần tháo để đáp ứng remaining_need
+                
+                # check capacity left (without overtime)
+                st_needed = 0 #setup time needed
+                if delta[p, t] == 0 and required_parent_units > 0: #nếu hôm nay chưa setup cha p và cần tháo
+                    st_needed = ST[p] #thời gian setup cần thiết cho item p
+                time_req_full = G[p] * required_parent_units + st_needed #tổng thời gian cần để tháo required_parent_units của cha p
+                
+                cap_avail_nominal = max(0.0, U[t] - capacity_used) #cần bao nhiều thời gian còn lại trong ca chính
+                cap_avail_total = max(0.0, U[t] + F[t] - capacity_used)  # including overtime potential #cần bao nhiêu thời gian còn lại trong ca chính + OT
+                
+                scheduled_units = 0
+                used_overtime = 0.0
+                
+                if time_req_full <= cap_avail_nominal + 1e-9:
+                    # enough nominal capacity to schedule all required_parent_units
+                    scheduled_units = required_parent_units
+                    time_used = time_req_full
+                else:
+                    # try to schedule as many as possible within nominal capacity (consider setup if needed)
+                    # if setup needed, reserve ST
+                    st_if_needed = st_needed
+                    # available time for processing parents after considering setup
+                    time_for_processing_nom = max(0.0, cap_avail_nominal - st_if_needed)
+                    possible_units_nom = int(floor(time_for_processing_nom / G[p])) if G[p] > 0 else 0
+                    if possible_units_nom > 0:
+                        scheduled_units = possible_units_nom
+                        time_used = scheduled_units * G[p] + st_if_needed
+                    else:
+                        # nominal can't schedule any; try using overtime
+                        # compute time available including overtime
+                        st_if_needed = st_needed
+                        time_for_processing_total = max(0.0, cap_avail_total - st_if_needed)
+                        possible_units_total = int(floor(time_for_processing_total / G[p])) if G[p] > 0 else 0
+                        if possible_units_total > 0:
+                            scheduled_units = possible_units_total
+                            # overtime used = max(0, time_used - cap_avail_nominal)
+                            time_used = scheduled_units * G[p] + st_if_needed
+                            used_overtime = max(0.0, time_used - cap_avail_nominal)
+                        else:
+                            scheduled_units = 0
+                            time_used = 0.0
+                            used_overtime = 0.0
+                
+                # schedule scheduled_units
+                if scheduled_units > 0:
+                    X[p, t] += scheduled_units
+                    if delta[p, t] == 0:
+                        delta[p, t] = 1
+                    capacity_used += scheduled_units * G[p]
+                    if delta[p, t] == 1:
+                        # ensure setup time is added once if scheduled this period
+                        # but avoid double counting: add setup_time only once per parent per period
+                        pass
+                    # add setup time once
+                    if setup_done[p] == 0 and delta[p, t] == 1:
+                        capacity_used += ST[p]
+                        setup_done[p] = 1
+                    
+                    # overtime usage tracked later as Y[t] = max(0, capacity_used - U[t]) but limited by F[t]
+                    # produced usable child units from scheduling scheduled_units of parent p:
+                    # parent produces multiple child types, not only i; generate receipts for all children
+                    arrival_period = t + L[p]
+                    if arrival_period > n_periods:
+                        arrival_period = n_periods  # if arrives beyond horizon, ignore (or cap)
+                    for c, Rpc in children[p].items():
+                        produced_raw = Rpc * scheduled_units
+                        usable = (1.0 - alpha[c]) * produced_raw
+                        # defective quantity for child c produced from p in period t
+                        W[c, t] += produced_raw - usable
+                        # schedule receipt at arrival_period (if within horizon)
+                        if arrival_period <= n_periods:
+                            receipts[c, arrival_period] += usable
+                    # reduce remaining_need by usable produced for child i
+                    produced_for_i = (1.0 - alpha[i]) * Rpi * scheduled_units
+                    remaining_need = max(0.0, remaining_need - produced_for_i)
+                # end scheduling for parent p
+                
+            # after attempting all parents, if still remaining need > 0:
+            if remaining_need > 0:
+                # we purchase the remaining_need immediately (assume available)
+                buy_qty = int(ceil(remaining_need))
+                Z[i, t] += buy_qty
+                # immediate fulfillment from purchase
+                Q_sold[i, t] += remaining_need
+                # any rounding surplus goes to inventory for next period
+                surplus = buy_qty - remaining_need
+                Iplus[i, t] += surplus
+                remaining_need = 0.0
+            
+            # finally, consume inventory to satisfy demand (if not already counted)
+            # If some demand was met by receipts earlier or purchases, reduce inventory accordingly
+            # Compute how much we can serve from current Iplus
+            serve = min(Iplus[i, t], demand)
+            Iplus[i, t] -= serve
+            Q_sold[i, t] += serve
+            unmet = demand - Q_sold[i, t]
+            if unmet > 1e-9:
+                # set backorder for next period
+                Iminus[i, t+1] += unmet
+    
+    # end of items in this period
+    # determine overtime used (capacity_used may include setup/time)
+    overtime_needed = max(0.0, capacity_used - U[t])
+    overtime_used = min(overtime_needed, F[t])
+    Y[t] = int(ceil(overtime_used))
+    # if overtime_used < overtime_needed, we had to leave some capacity requests unscheduled; but we already purchased or backordered earlier.
+    
+    # compute inventory carry to next period (Iplus[:, t+1] already has receipts scheduled; add leftover Iplus)
+    for i in range(n_items):
+        # Iplus[i, t] is current end-of-period inventory after consumption; carry to next period
+        Iplus[i, t+1] += Iplus[i, t]
+        # ensure non-negatives
+        Iplus[i, t+1] = max(0.0, Iplus[i, t+1])
+        Iminus[i, t+1] = max(0.0, Iminus[i, t+1])
+
+# ---------- Compute costs and summary ----------
+# Sales revenue = SC * total sold (Q_sold)
+total_sold = Q_sold.sum()
+revenue = (SC.reshape(-1,1) * Q_sold).sum()
+
+# Costs:
+setup_cost = (delta.sum(axis=1) * S).sum()  # but delta sum per item across periods * S_i; slight overcount if S is per setup; fine for heuristic
+holding_cost = 0.0
+purchase_cost = (Z * C.reshape(-1,1)).sum()
+backorder_cost = 0.0
+overtime_cost = (Y * Ocost).sum()
+for t in range(n_periods):
+    holding_cost += (Iplus[:, t+1] * h).sum()  # holding cost for inventory held into next period
+    backorder_cost += (Iminus[:, t+1] * b).sum()
+
+total_cost = setup_cost + holding_cost + purchase_cost + backorder_cost + overtime_cost
+profit = revenue - total_cost
+
+# ---------- Print summary ----------
+print("=== Simulation summary (Heuristic 1 - Bottom-Up Greedy) ===")
+print(f"Periods: {n_periods}, Items: {n_items}")
+print("\nBOM:", BOM)
+print("\nItem-level table:")
+print(item_data)
+print("\nTime data:")
+print(time_data)
+print("\nTotal sold units:", int(total_sold))
+print(f"Revenue = {revenue:.2f}")
+print(f"Setup cost = {setup_cost:.2f}")
+print(f"Holding cost = {holding_cost:.2f}")
+print(f"Purchase cost = {purchase_cost:.2f}")
+print(f"Backorder cost = {backorder_cost:.2f}")
+print(f"Overtime cost = {overtime_cost:.2f}")
+print(f"TOTAL COST = {total_cost:.2f}")
+print(f"PROFIT = {profit:.2f}")
+
+# Print some matrices (trimmed)
+print("\nDisassembly X (per parent x period):")
+dfX = pd.DataFrame(X, columns=[f"P{t+1}" for t in range(n_periods)], index=[f"Item_{i+1}" for i in range(n_items)])
+print(dfX)
+
+print("\nPurchases Z (per item x period):")
+dfZ = pd.DataFrame(Z, columns=[f"P{t+1}" for t in range(n_periods)], index=[f"Item_{i+1}" for i in range(n_items)])
+print(dfZ)
+
+print("\nOvertime Y per period:", Y)
+print("\nEnding inventory I+ (end of horizon):")
+dfIend = pd.DataFrame(Iplus[:, 1:], columns=[f"P{t+1}" for t in range(n_periods)], index=[f"Item_{i+1}" for i in range(n_items)])
+print(dfIend)
+
+# Save outputs to CSV for further inspection if desired
+dfX.to_csv("heuristic1_X.csv")
+dfZ.to_csv("heuristic1_Z.csv")
+dfIend.to_csv("heuristic1_Iend.csv")
+pd.DataFrame(Y, index=[f"P{t+1}" for t in range(n_periods)], columns=["Overtime"]).to_csv("heuristic1_Y.csv")
+
