@@ -225,7 +225,7 @@ def check_disassemble_feasibility_and_cost(item, t_now, qty_needed, parent): #! 
     Kiểm tra xem có THỂ tháo dỡ không và tốn bao nhiêu tiền. Check từng item cha xem item nào tháo phù hợp và sinh lời nhiều nhất (leadtime ở đây variable, miễn là đáp ứng đủ)
     """
     raw_yield = BOM[parent][item] #! Số lượng item sinh ra từ cha p
-    real_yield = raw_yield * (1.0 - alpha[item]) #! số lượng item thật sự đạt được (sau khi - defective rate)
+    real_yield = raw_yield * (1.0 - alpha[parent]) #! số lượng item thật sự đạt được (sau khi - defective rate)
     
     if real_yield <= 0: return float('inf'), 0, 0 
     
