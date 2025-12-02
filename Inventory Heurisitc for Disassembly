@@ -1,0 +1,401 @@
+import numpy as np
+import pandas as pd
+from math import ceil
+
+# ==============================================================================
+# 1. DATA GENERATION (VERY SMALL SCALE FOR MANUAL CHECK)
+# ==============================================================================
+# Setup: 3 Items, 4 Periods
+n_items = 3
+n_periods = 4
+
+# --- BOM STRUCTURE ---
+# Item 0 (Cha) ra 1 Item 1 + 1 Item 2
+BOM = {
+    0: {1: 1, 2: 1}, 
+    1: {}, 
+    2: {}
+}
+
+# Helper maps
+parents = {i: [] for i in range(n_items)}
+for p, children in BOM.items():
+    for c in children:
+        parents[c].append(p)
+
+# Levels: Bottom-Up (Con -> Cha)
+levels = {1: [0], 2: [1, 2]}
+sorted_levels = [2, 1]
+
+# --- PARAMETERS (HARDCODED FOR EASY MATH) ---
+# Leadtime: Con mất 1 kỳ để tháo. Cha có ngay.
+lead_time = np.array([1, 1, 1]) 
+
+# Costs
+# Giá mua con (1, 2) RẤT ĐẮT (100) để khuyến khích tháo.
+# Giá mua cha (0) RẺ (10).
+v_buy = np.array([10, 100, 100])      
+setup_cost = np.array([50, 50, 50])    # Setup
+holding = np.array([1, 2, 2])         # Holding
+backorder = np.array([100, 100, 100]) # Backorder cao
+sale_price = v_buy * 1.5              # Giá bán
+
+# Operations
+dis_time = np.array([1, 1, 1])        # Thời gian tháo 1 cái = 1 giờ
+setup_time = np.array([0, 10, 10])    # Thời gian setup = 10 giờ
+alpha = np.array([0.0, 0.0, 0.0])     # Không hỏng (0%)
+
+# Capacity (Dư dả để không bị chặn bởi Capacity trong test này)
+U_cap = np.full(n_periods, 1000) 
+F_over = np.full(n_periods, 100)
+O_cost = np.full(n_periods, 20)
+
+# --- DEMAND INPUT ---
+Demand = np.zeros((n_items, n_periods), dtype=int)
+
+# TEST CASE 1: Item 1 cần gấp 10 cái ở P1 (Index 0) 
+# -> Leadtime=1 -> Cần tháo ở P(-1) -> Bất khả thi -> Phải MUA.
+Demand[1, 0] = 10 
+
+# TEST CASE 2: Item 2 cần 10 cái ở P3 (Index 2) 
+# -> Leadtime=1 -> Cần tháo ở P2 (Index 1) -> Khả thi -> Sẽ THÁO.
+Demand[2, 2] = 10
+
+cols = [f"P{t+1}" for t in range(n_periods)]
+idx_all = [f"Item_{i}" for i in range(n_items)]
+
+print("\n" + "="*80)
+print("=== [INPUT] SMALL SCALE DEMAND (3 Items x 4 Periods) ===")
+print("="*80)
+print(pd.DataFrame(Demand, columns=cols, index=idx_all).replace(0, '-'))
+print("="*80 + "\n")
+
+# ==============================================================================
+# 2. GLOBAL STATE & TRACKING
+# ==============================================================================
+# Net Demand: Nhu cầu ròng (Cập nhật liên tục khi Demand truyền từ con lên cha)
+net_demand = Demand.copy()
+
+# Decision Matrices
+X = np.zeros((n_items, n_periods), dtype=int)   # Disassemble Qty
+Z = np.zeros((n_items, n_periods), dtype=int)   # Buy Qty / Retrieve Qty
+Y = np.zeros(n_periods, dtype=int)              # Overtime Used (Hours)
+
+# Inventory Tracking
+Iplus = np.zeros((n_items, n_periods + 1))      # Inventory On Hand
+Iminus = np.zeros((n_items, n_periods + 1))     # Backorders
+
+# Constraint Tracking
+cap_used = np.zeros(n_periods, dtype=float)     # Capacity đã dùng
+setup_done = np.zeros((n_items, n_periods), dtype=int) # Đánh dấu đã setup máy chưa
+
+# ==============================================================================
+# 3. COST & FEASIBILITY FUNCTIONS (HYBRID LOGIC)
+# ==============================================================================
+
+def get_buy_cost_silver_meal(item, t_now, k, curr_demands):
+    """
+    Tính chi phí Mua gộp cho k kỳ tiếp theo (t_now -> t_now + k).
+    Công thức: Setup + (Total_Qty * Price) + Holding_Cost_Tích_Lũy
+    """
+    total_qty = 0
+    h_cost = 0
+    
+    # Duyệt các kỳ tương lai được gộp vào
+    for j in range(k + 1):
+        target_period = t_now + j
+        
+        # Nếu vượt quá số kỳ hoạch định -> Dừng
+        if target_period >= n_periods: 
+            break
+            
+        d = curr_demands[item, target_period]
+        total_qty += d
+        
+        # Holding Cost:
+        # Mua tại t_now để dùng cho target_period (cách j kỳ)
+        # Cost = lượng hàng * số kỳ lưu kho * đơn giá lưu kho
+        if j > 0:
+            h_cost += d * j * holding[item]
+            
+    if total_qty == 0: 
+        return float('inf'), 0
+    
+    # Tổng chi phí
+    purchase_c = total_qty * v_buy[item]
+    setup_c = setup_cost[item]
+    
+    total_cost = setup_c + purchase_c + h_cost
+    
+    return total_cost, total_qty
+
+def check_disassemble_feasibility_and_cost(item, t_now, qty_needed, parent): #! Input (item hiện tại, t hiện tại, số lượng cần cho kì t hiện tại, cha p)
+    """
+    Kiểm tra xem có THỂ tháo dỡ không và tốn bao nhiêu tiền. Check từng item cha xem item nào tháo phù hợp và sinh lời nhiều nhất (leadtime ở đây variable, miễn là đáp ứng đủ)
+    """
+    raw_yield = BOM[parent][item] #! Số lượng item sinh ra từ cha p
+    real_yield = raw_yield * (1.0 - alpha[item]) #! số lượng item thật sự đạt được (sau khi - defective rate)
+    
+    if real_yield <= 0: return float('inf'), 0, 0 
+    
+    qty_parent = int(ceil(qty_needed / real_yield)) #! Số lượng cha item p cần
+    start_time = t_now - lead_time[parent] #! Thời gian cần bắt đầu tháo
+    
+    # 1. Timing Constraint
+    if start_time < 0:
+        return float('inf'), 0, 0 #! Nếu thời gian cần để tháo < period 0
+    
+    # 2. Capacity Constraint
+    run_time_needed = qty_parent * dis_time[parent] #! Thời gian cần để tháo item cha
+    setup_time_needed = 0
+    if setup_done[parent, start_time] == 0:
+        setup_time_needed = setup_time[parent]
+    total_time_needed = run_time_needed + setup_time_needed
+    
+    current_used = cap_used[start_time]
+    max_avail = U_cap[start_time] + F_over[start_time]
+    
+    if (current_used + total_time_needed) > max_avail: #! Nếu thời gian cần quá thời gian max cho phép --> quá tải
+        return float('inf'), 0, 0
+        
+    # 3. Cost Calculation
+    nominal_cap = U_cap[start_time]
+    new_usage = current_used + total_time_needed
+    est_overtime = max(0, new_usage - nominal_cap)
+    
+    cost_ot = est_overtime * O_cost[start_time]
+    cost_setup = setup_cost[parent] if setup_done[parent, start_time] == 0 else 0
+    cost_material = qty_parent * v_buy[parent]
+    
+    total_est_cost = cost_setup + cost_material + cost_ot # Total cost = setup máy + chi phí mua của item cha + chi phí overtime (nếu có)
+    
+    return total_est_cost, qty_parent, start_time #Trả về total cost, số lượng item cha cần tháo thật sự, thời gian bắt đầu
+
+# ==============================================================================
+# 4. MAIN ALGORITHM (HYBRID + SILVER MEAL)
+# ==============================================================================
+print("LOG: STARTING SIMULATION...\n")
+
+for lvl in sorted_levels: # Bottom-Up: 3 -> 2 -> 1
+    print(f">>> Processing Level {lvl} Items: {levels[lvl]}")
+    
+    for item in levels[lvl]:
+        
+        # --- LOGIC RIÊNG CHO ITEM 0 (ROOT) ---
+        if item == 0:
+            t = 0
+            while t < n_periods:
+                needed = net_demand[item, t]
+                if needed > 0:
+                    Z[item, t] += needed 
+                    print(f"   [Item 0 @ P{t+1}] Need {needed} -> DECISION: RETRIEVE from Yard.")
+                    net_demand[item, t] = 0
+                t += 1
+            continue
+        # -------------------------------------
+
+        # Xử lý các Item khác
+        t = 0
+        while t < n_periods:
+            needed = net_demand[item, t]
+            
+            if needed <= 0: #! Không xét tới các kì không có nhu cầu --> lặp tới kì có nhu cầu
+                t += 1; continue
+            
+            print(f"   [Item {item} @ P{t+1}] Need: {needed}")
+            
+            # --- BƯỚC 1: TÌM PHƯƠNG ÁN MUA TỐT NHẤT (SILVER-MEAL) ---
+            # Thử gộp demand từ k=0 đến k=4
+            best_buy = {'k': 0, 'avg_cost': float('inf'), 'qty': 0, 'total_cost': float('inf')}
+            
+            look_ahead_limit = min(4, n_periods - t) # Không nhìn quá 4 kỳ hoặc quá Horizon
+            
+            for k in range(look_ahead_limit):
+                tc, qty = get_buy_cost_silver_meal(item, t, k, net_demand)
+                
+                if qty == 0: continue
+                
+                # Metric so sánh: Average Cost per Period
+                avg = tc / (k + 1)
+                
+                if avg < best_buy['avg_cost']:
+                    best_buy = {'k': k, 'avg_cost': avg, 'qty': qty, 'total_cost': tc} #! Silver meal tốt nhất cho buy
+            
+            # --- BƯỚC 2: TÌM PHƯƠNG ÁN THÁO (CHỈ CHO KỲ HIỆN TẠI) ---
+            best_dis = {'cost': float('inf'), 'p': None}
+            parents_list = parents.get(item, [])
+            for p in parents_list: #! Tính xem trong tất cả các item p item nào có chi phí dỡ rẻ nhất
+                c, qp, st = check_disassemble_feasibility_and_cost(item, t, needed, p) 
+                if c < best_dis['cost']:
+                    best_dis = {'cost': c, 'p': p, 'qp': qp, 'st': st}
+            
+            # --- BƯỚC 3: SO SÁNH & QUYẾT ĐỊNH ---
+            decision = "BUY"
+            
+            # Nếu Tháo rẻ hơn Avg Cost của Mua gộp -> Chọn Tháo
+            if best_dis['p'] is not None and best_dis['cost'] < best_buy['avg_cost']:
+                decision = "DISASSEMBLE"
+            
+            # --- BƯỚC 4: THỰC THI ---
+            if decision == "BUY":
+                buy_qty = best_buy['qty'] 
+                periods_covered = best_buy['k']
+                
+                Z[item, t] += buy_qty
+                print(f"      -> DECISION: BATCH BUY {buy_qty} (Cover P{t+1} to P{t+1+periods_covered}). AvgCost ~{best_buy['avg_cost']:.1f}")
+                
+                # [QUAN TRỌNG] Xóa Demand của các kỳ tương lai đã gộp
+                for j in range(periods_covered + 1):
+                    target_p = t + j
+                    if target_p < n_periods:
+                        net_demand[item, target_p] = 0
+                
+                # Nhảy cóc t (bỏ qua các kỳ đã xử lý xong)
+                t += periods_covered + 1
+            
+            else: # DISASSEMBLE
+                p = best_dis['p']
+                qp = best_dis['qp']
+                st = best_dis['st']
+                
+                print(f"-> DECISION: DISASSEMBLE Parent {p}. Qty Parent={qp}. Start P{st+1} -> Arrive P{t+1}. Cost ~{best_dis['cost']:.1f}")
+                
+                # Cập nhật
+                X[p, st] += qp
+                
+                # Trừ Capacity
+                run_h = qp * dis_time[p]
+                setup_h = 0
+                if setup_done[p, st] == 0:
+                    setup_h = setup_time[p]
+                    setup_done[p, st] = 1
+                cap_used[st] += run_h + setup_h
+                
+                # Truyền Demand lên Cha
+                if p != 0: 
+                    net_demand[p, st] += qp
+                    print(f" -> Propagated Demand: Parent {p} now needs +{qp} at P{st+1}")
+                else:
+                    # [SỬA LỖI] Vẫn phải cộng demand vào Item 0 để nó biết mà Retrieve
+                    net_demand[p, st] += qp
+                    print(f"         -> Triggered Yard Retrieval for Item 0 (+{qp}) at P{st+1}")
+                
+                # Xử lý Sibling
+                for sib, raw_rate in BOM[p].items():
+                    qty_created = int(qp * raw_rate * (1.0 - alpha[sib])) #! Số lượng tạo ra từ item cha
+                    if qty_created > 0:
+                        if sib == item: # Nếu là item hiện tại, surplus đã trừ needed
+                             surplus = qty_created - needed
+                             if surplus > 0:
+                                 rem = surplus #!phần dư, item cha tháo ra - item con 
+                                 for future_t in range(t+1, n_periods):
+                                     if rem <= 0: break
+                                     if net_demand[sib, future_t] > 0:
+                                         take = min(rem, net_demand[sib, future_t])
+                                         net_demand[sib, future_t] -= take #! Cập nhật lại net demand vì đã được satisfy ròi
+                                         rem -= take
+                                         print(f" -> Sibling {sib} surplus used for P{future_t+1}")
+                        else: # Sibling khác
+                            print(f"         -> Sibling {sib} created (+{qty_created}) at P{t+1}")
+                            rem = qty_created
+                            for future_t in range(t, n_periods):
+                                if rem <= 0: break
+                                if net_demand[sib, future_t] > 0:
+                                    take = min(rem, net_demand[sib, future_t])
+                                    net_demand[sib, future_t] -= take #! Cập nhật lại net demand vì đã được satisfy ròi
+                                    rem -= take
+                                    print(f"            -> Used to satisfy {sib} demand at P{future_t+1}")
+            
+                # Disassemble chỉ giải quyết kỳ hiện tại, tăng t lên 1
+                t += 1
+
+# ==============================================================================
+# 5. FINAL REPORT & FINANCIALS
+# ==============================================================================
+total_revenue = 0
+total_setup_cost = 0
+total_holding_cost = 0
+total_backorder_cost = 0
+total_purchase_cost = 0
+total_overtime_cost = 0
+
+for t in range(n_periods):
+    ot_needed = max(0, cap_used[t] - U_cap[t])
+    Y[t] = ceil(ot_needed)
+    total_overtime_cost += Y[t] * O_cost[t]
+print("TÙNG PHƯƠNG YÊU DẤU: ",setup_done)
+for i in range(n_items):
+    # Loại bỏ Item 0 khỏi báo 
+    total_setup_cost += np.sum(setup_done[i, :]) * setup_cost[i]
+    if i == 0:
+        Iplus[i, :] = 0
+        Iminus[i, :] = 0
+        continue 
+
+    curr_inv = 0
+    
+    for t in range(n_periods):
+        s_buy = Z[i, t]
+        total_purchase_cost += s_buy * v_buy[i]
+        
+        s_dis = 0
+        for p in parents.get(i, []):
+            if t - lead_time[p] >= 0:
+                yield_real = BOM[p][i] * (1.0 - alpha[i])
+                s_dis += X[p, t - lead_time[p]] * yield_real
+        
+        total_demand_t = Demand[i, t] + X[i, t]
+        total_revenue += Demand[i, t] * sale_price[i]
+        
+        balance = curr_inv + s_buy + s_dis - total_demand_t
+        
+        if balance >= 0:
+            Iplus[i, t+1] = balance
+            curr_inv = balance
+            total_holding_cost += balance * holding[i]
+        else:
+            Iminus[i, t+1] = abs(balance)
+            curr_inv = balance
+            total_backorder_cost += abs(balance) * backorder[i]
+
+profit = total_revenue - (total_setup_cost + total_holding_cost + total_purchase_cost + total_backorder_cost + total_overtime_cost)
+
+# --- PRINT TABLES ---
+print("\n" + "="*80)
+print("=== FINAL RESULTS (LARGE SCALE + SILVER MEAL) ===")
+print("="*80)
+
+print(f"Total Revenue:       {total_revenue:,.2f}")
+print(f"Total Costs:         {(total_revenue - profit):,.2f}")
+print(f"  - Purchase Cost:   {total_purchase_cost:,.2f}")
+print(f"  - Setup Cost:      {total_setup_cost:,.2f}")
+print(f"  - Holding Cost:    {total_holding_cost:,.2f}")
+print(f"  - Overtime Cost:   {total_overtime_cost:,.2f}")
+print(f"  - Backorder Cost:  {total_backorder_cost:,.2f} (Should be near 0)")
+print(f"PROFIT:              {profit:,.2f}")
+print("-" * 80)
+
+print("\n1. Disassembly Plan (X) - When to START disassembly:")
+print(pd.DataFrame(X, columns=cols, index=idx_all).replace(0, '-'))
+
+print("\n2. Purchase Plan (Z) - Instant Buy (Batching Applied):")
+df_Z = pd.DataFrame(Z, columns=cols, index=idx_all)
+print(df_Z.iloc[1:].replace(0, '-'))
+
+print("\n2b. Yard Retrieval (Item 0 Only):")
+print(df_Z.iloc[:1].replace(0, '-'))
+
+print("\n3. Capacity Usage (Hours):")
+df_cap = pd.DataFrame({
+    'Available (U)': U_cap,
+    'Max OT (F)': F_over,
+    'Used': cap_used,
+    'Overtime (Y)': Y
+}, index=cols)
+print(df_cap.T)
+
+print("\n4. Ending Inventory (I+):")
+print(pd.DataFrame(Iplus[:, 1:], columns=cols, index=idx_all).replace(0, '-'))
+
+print("\n5. Backorders (I-):")
+print(pd.DataFrame(Iminus[:, 1:], columns=cols, index=idx_all).replace(0, '-'))
