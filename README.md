@@ -35,9 +35,8 @@ https://github.com/user-attachments/assets/add0ebec-3bdc-49f3-9768-915e5a440691
 
 ### 2. Statistical Validation (Hypothesis Testing)
 Automated statistical tests to determine if data populations are significantly different or stable over time:
-* **Two-Sample Testing:** T-Test, Mann-Whitney U Test (for checking stability between two datasets).
+* **Two-Sample Testing:** T-Test, Z-Test(for checking stability between two datasets).
 * **Multi-Sample Testing:** One-way **ANOVA** (Analysis of Variance) for comparing multiple groups/populations.
-* **Normality Check:** Shapiro-Wilk test integration.
 
 ### 3. Advanced Visualization
 Instant plotting to visualize data distribution and detect outliers:
