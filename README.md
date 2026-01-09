@@ -35,7 +35,7 @@ https://github.com/user-attachments/assets/add0ebec-3bdc-49f3-9768-915e5a440691
 
 ### 2. Statistical Validation (Hypothesis Testing)
 Automated statistical tests to determine if data populations are significantly different or stable over time:
-* **Two-Sample Testing:** T-Test, Z-Test(for checking stability between two datasets).
+* **Two-Sample Testing:** T-Test, Z-Test (for checking stability between two datasets).
 * **Multi-Sample Testing:** One-way **ANOVA** (Analysis of Variance) for comparing multiple groups/populations.
 
 ### 3. Advanced Visualization
@@ -51,8 +51,8 @@ Instant plotting to visualize data distribution and detect outliers:
 
 | Data Input Interface | Visualization & Results |
 | :---: | :---: |
-| ![Input Screen]<img width="1918" height="1022" alt="Screenshot 2026-01-10 013036" src="https://github.com/user-attachments/assets/97761993-635b-42a6-b9c5-a8aad5261f6a" />
-| ![Chart Screen] (<img width="796" height="1005" alt="Screenshot 2026-01-10 013012" src="https://github.com/user-attachments/assets/605483da-25e1-42e4-8e0d-f38a407ff4aa" />)
+| ![Input Screen] <img width="1918" height="1022" alt="Screenshot 2026-01-10 013036" src="https://github.com/user-attachments/assets/97761993-635b-42a6-b9c5-a8aad5261f6a" />
+| ![Chart Screen] <img width="796" height="1005" alt="Screenshot 2026-01-10 013012" src="https://github.com/user-attachments/assets/605483da-25e1-42e4-8e0d-f38a407ff4aa" />
 
 ---
 
