@@ -17,7 +17,11 @@ Before feeding data into complex Optimization models or Forecasting algorithms, 
 See the tool in action:
 
 
-https://github.com/user-attachments/assets/38cd42fa-1157-4556-866a-0f9aed6b2254
+
+
+https://github.com/user-attachments/assets/add0ebec-3bdc-49f3-9768-915e5a440691
+
+
 
 
 
